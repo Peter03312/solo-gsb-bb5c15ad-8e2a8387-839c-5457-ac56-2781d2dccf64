@@ -165,3 +165,35 @@ def conflict_summary(result: SolveResult) -> dict[str, Any]:
             for leaf in sorted(leaves, key=lambda l: l.package)
         ],
     }
+
+
+def resolution_body(
+    result: SolveResult,
+    *,
+    allow_prereleases: bool,
+    max_attempts: int,
+) -> tuple[dict[str, Any], int]:
+    """Render a :class:`SolveResult` as the public ``/resolve`` response body.
+
+    Returns ``(body, http_status)``: 200 for ``ok``; 409 for ``conflict``
+    and ``limit`` (the latter also carries an ``error`` object).  Shared by
+    the synchronous endpoint, the job worker and the environment matrix.
+    """
+    body: dict[str, Any] = {
+        "status": result.status,
+        "attempts": result.attempts,
+        "allow_prereleases": allow_prereleases,
+    }
+    if result.status == "ok":
+        body["resolved"] = result.chosen
+        body["dependency_graph"] = result.edges
+        body["locks"] = result.lock_notes
+        return body, 200
+    body["locks"] = result.lock_notes
+    body["conflict"] = conflict_summary(result)
+    if result.status == "limit":
+        body["error"] = {
+            "code": "search_limit_exceeded",
+            "message": f"resolution exceeded {max_attempts} candidate evaluations",
+        }
+    return body, 409

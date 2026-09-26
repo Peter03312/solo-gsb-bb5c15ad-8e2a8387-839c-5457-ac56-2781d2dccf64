@@ -53,6 +53,13 @@
   菱形结构的有向图上找出每个可达包的**必经依赖**（支配者，任一路径都无法绕过）；
   再按每个必经包汇总其**独占支配**的下游包（支配树后代）及数量，结果稳定排序，
   `<root>` 不可达的包单列。
+- **多环境版本矩阵**：`POST /analyze/environment-matrix` 接收与 `/resolve` 相同的
+  `packages`、`root`、`locks`、`allow_prereleases`、`max_attempts`，另接收 2～8 个
+  名称唯一的环境（`name` + `marker_env`）。每个环境用各自的标记环境**独立**解析
+  根需求与传递依赖，各自保留 `ok` / `conflict` / `limit` 结果与 `attempts`——一个
+  环境触顶或冲突不影响其他环境。仅对成功环境汇总版本矩阵：单元格为已解析版本，
+  缺席（未被选中）为 `null`，与任何具体版本明确区分；`differences` 列出版本或
+  存在性不同的包（成功环境少于两个时为空）。环境按输入顺序、包按规范名称排序。
 
 ## 一条命令启动
 
@@ -71,6 +78,7 @@ docker compose up --build
 - `POST /audit/licenses` — 用本地许可证策略审计已解析的包
 - `POST /audit/dependency-chokepoints` — 审计依赖图的必经依赖（支配者/关键节点）
 - `POST /plan/rebuild` — 为本地变更包生成确定性的重建计划
+- `POST /analyze/environment-matrix` — 在多个标记环境下独立解析并汇总版本矩阵
 - `POST /jobs` — 提交异步解析作业（立即返回 `202` 与作业 ID）
 - `GET /jobs/{id}` — 查询作业状态与最终响应
 - `DELETE /jobs/{id}` — 取消作业
@@ -561,6 +569,106 @@ curl -s -X POST localhost:8000/diagnose/root-conflict \
 求解与全部复算实际求值的候选次数）。注意最小冲突集合不唯一时，结果取决于上述
 稳定删除顺序，但恒为“删任一条即可解”的最小集合。
 
+## 多环境版本矩阵 API
+
+`POST /analyze/environment-matrix` 接收与 `/resolve` 相同的 `packages`、`root`、
+`locks`、`allow_prereleases`、`max_attempts`（校验规则完全一致，复用同一套
+PEP 440/508 解析），另接收 2～8 个环境，回答：**同一组需求在不同部署环境
+（不同 PEP 508 标记环境）下分别解析出什么版本？**
+
+每个环境用各自的 `marker_env` 覆盖默认标记环境后**独立**完整求解根需求与传递
+依赖，且各自拥有全新的 `max_attempts` 预算：一个环境冲突或触顶不会中断、也不会
+消耗其他环境的预算，每个环境都保留自己的 `ok` / `conflict` / `limit` 结果与
+`attempts`。
+
+```bash
+curl -s -X POST localhost:8000/analyze/environment-matrix \
+  -H 'Content-Type: application/json' -d '{
+  "packages": {
+    "app": {"1.0": {"dependencies": [
+      "lib>=1.0",
+      "plat<2.0; sys_platform == \"linux\"",
+      "plat>=2.0; sys_platform == \"win32\"",
+      "winonly; sys_platform == \"win32\""
+    ]}},
+    "lib": {"1.0": {}, "2.0": {}},
+    "plat": {"1.0": {}, "2.0": {}},
+    "winonly": {"1.0": {}}
+  },
+  "root": ["app"],
+  "environments": [
+    {"name": "linux",   "marker_env": {"sys_platform": "linux"}},
+    {"name": "windows", "marker_env": {"sys_platform": "win32"}}
+  ]
+}'
+```
+
+请求字段（`packages` / `root` / `locks` / `allow_prereleases` / `max_attempts`
+与 `/resolve` 相同，不再赘述）：
+
+- `environments`：2～8 个环境，按输入顺序处理与输出。每项：
+  - `name`：环境名，同一请求内必须唯一且非空（空白名同样拒绝）；
+  - `marker_env`：可选，该环境的 PEP 508 标记求值覆盖（缺省为 `{}`，即使用
+    与 `/resolve` 相同的固定默认环境）。
+- 本接口**没有**顶层 `marker_env`：标记环境一律按环境分别给出。
+
+响应（合法请求恒为 200，各环境的结果内联在 `environments` 中）：
+
+```json
+{
+  "status": "ok",
+  "allow_prereleases": false,
+  "summary": {"environments": 2, "ok": 2, "conflict": 0, "limit": 0},
+  "environments": [
+    {
+      "name": "linux", "status": "ok", "attempts": 3, "allow_prereleases": false,
+      "resolved": {"app": "1.0", "lib": "2.0", "plat": "1.0"},
+      "dependency_graph": [ ... ], "locks": {}
+    },
+    {
+      "name": "windows", "status": "ok", "attempts": 4, "allow_prereleases": false,
+      "resolved": {"app": "1.0", "lib": "2.0", "plat": "2.0", "winonly": "1.0"},
+      "dependency_graph": [ ... ], "locks": {}
+    }
+  ],
+  "matrix": {
+    "environments": ["linux", "windows"],
+    "packages": [
+      {"package": "app",     "versions": {"linux": "1.0", "windows": "1.0"}},
+      {"package": "lib",     "versions": {"linux": "2.0", "windows": "2.0"}},
+      {"package": "plat",    "versions": {"linux": "1.0", "windows": "2.0"}},
+      {"package": "winonly", "versions": {"linux": null,  "windows": "1.0"}}
+    ],
+    "differences": [
+      {"package": "plat",    "versions": {"linux": "1.0", "windows": "2.0"}},
+      {"package": "winonly", "versions": {"linux": null,  "windows": "1.0"}}
+    ]
+  }
+}
+```
+
+- `environments`：每个环境一项（按输入顺序），内容为该环境独立求解的完整
+  `/resolve` 响应体（`status` / `attempts` / `resolved` / `dependency_graph` /
+  `locks`，冲突或触顶时改为 `conflict` 报告与 `error`），外加 `name`。
+- `matrix`：**仅汇总成功环境**（`ok`）：
+  - `environments`：参与矩阵的成功环境名（按输入顺序）；
+  - `packages`：任一成功环境解析出的全部包（按规范名称排序），`versions` 的
+    单元格为该环境下的已解析版本；包在某环境**缺席**（未被选中）时为 `null`，
+    与任何具体版本明确区分；
+  - `differences`：版本或存在性在不同成功环境间不一致的包（`packages` 中对应
+    条目的子集，同样按包名排序）；成功环境少于两个时恒为空。
+- `summary`：各状态环境计数；顶层 `status` 为汇总状态——全部成功为 `ok`，
+  任一环境触顶为 `limit`（触顶不是无解的证据，优先级高于冲突），否则为
+  `conflict`。
+- 矩阵是确定的：环境按输入顺序、包按规范名称排序，相同输入永远得到相同输出。
+
+校验规则（与 `/resolve` 相同的输入错误返回 `400`，schema 错误返回 `422`）：
+
+- `packages` / `root` / `locks` 的校验与 `/resolve` 完全一致（复用同一解析与
+  校验代码）；
+- 环境数量必须为 2～8（否则 `422`）；环境名必须非空且唯一（否则 `400`）；
+- 环境对象与请求顶层均不接受多余字段（否则 `422`）。
+
 ## 数据持久化
 
 异步作业保存在 SQLite（WAL 模式），数据库路径由环境变量 `RESOLVER_DB` 控制，
@@ -574,7 +682,9 @@ curl -s -X POST localhost:8000/diagnose/root-conflict \
 
 ## 请求格式
 
-`/resolve`、`POST /jobs` 与 `/diagnose/root-conflict` 使用**完全相同**的请求体：
+`/resolve`、`POST /jobs` 与 `/diagnose/root-conflict` 使用**完全相同**的请求体
+（`/analyze/environment-matrix` 复用其中除 `marker_env` 外的全部字段，另加
+`environments`，见上文）：
 
 ```json
 {
@@ -719,15 +829,16 @@ pytest -q
 ```
 app/
   resolver.py       # PEP 440/508 解析、候选排序、回溯求解器、冲突数据结构、取消点
-  serialize.py      # 冲突树 / 终态冲突的 JSON 序列化
+  serialize.py      # 冲突树 / 终态冲突的 JSON 序列化、求解结果的公共响应体
   diagnose.py       # 根需求冲突诊断：逐条暂删+复算的最小冲突根集合（搜索触顶返回未确定）
+  environment_matrix.py # 多环境矩阵：每环境独立求解（独立预算）、成功环境版本矩阵与差异
   audit.py          # 漏洞审计：公告匹配、图一致性校验、<root> 最短路径枚举
   chokepoint_audit.py # 关键节点审计：可达性、支配者不动点、支配树与独占支配汇总
   license_audit.py  # 许可证审计：SPDX 表达式解析、AND/OR/WITH 策略求值、决定性标识符
   rebuild.py        # 重建计划：反向依赖传播、Tarjan 环压缩、依赖优先并行 stages、最短反向路径
   jobs.py           # SQLite 作业存储、BEGIN IMMEDIATE 原子领取、后台 worker
-  main.py           # FastAPI 应用与 /resolve、/diagnose/root-conflict、/audit/*、/plan/rebuild、/jobs、/health
-tests/              # 端到端 API 测试（含漏洞、关键节点、许可证审计与重建计划）、根冲突诊断测试（含随机暴力对照）、作业持久化/取消测试、求解器单元测试（含随机暴力对照）
+  main.py           # FastAPI 应用与 /resolve、/diagnose/root-conflict、/audit/*、/plan/rebuild、/analyze/environment-matrix、/jobs、/health
+tests/              # 端到端 API 测试（含漏洞、关键节点、许可证审计、重建计划与多环境矩阵）、根冲突诊断测试（含随机暴力对照）、作业持久化/取消测试、求解器单元测试（含随机暴力对照）
 data/               # 运行时生成：SQLite 数据库（RESOLVER_DB，已 gitignore）
 Dockerfile
 docker-compose.yml

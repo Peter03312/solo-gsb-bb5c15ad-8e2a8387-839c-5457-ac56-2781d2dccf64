@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .audit import run_audit
 from .chokepoint_audit import run_dependency_chokepoints
 from .diagnose import run_root_conflict_diagnosis
+from .environment_matrix import run_environment_matrix
 from .license_audit import run_license_audit
 from .jobs import (
     CANCELLED,
@@ -30,7 +31,7 @@ from .resolver import (
     parse_root_entries,
     resolve,
 )
-from .serialize import conflict_summary
+from .serialize import resolution_body
 
 DEFAULT_DB_PATH = os.path.join("data", "jobs.db")
 
@@ -65,6 +66,55 @@ class ResolveRequest(BaseModel):
     max_attempts: int = Field(
         default=100_000, ge=1, le=10_000_000,
         description="Bound on candidate evaluations to keep resolution finite.",
+    )
+
+
+class EnvironmentInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(
+        ...,
+        description="Environment name; names must be unique and non-empty within one request.",
+    )
+    marker_env: dict[str, str] = Field(
+        default_factory=dict,
+        description="Override values for PEP 508 environment marker evaluation in this environment.",
+    )
+
+
+class EnvironmentMatrixRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    packages: dict[str, dict[str, Any]] = Field(
+        ...,
+        description=(
+            "Package index: package name -> version -> entry. "
+            "Each entry may contain 'dependencies' as either "
+            "{package: specifier} or a list of PEP 508 strings."
+        ),
+    )
+    root: Any = Field(
+        ...,
+        description="Root requirements: {package: specifier} or a list of PEP 508 strings.",
+    )
+    locks: Optional[dict[str, str]] = Field(
+        default=None,
+        description="Optional pinned versions. Pins are kept while they satisfy all constraints.",
+    )
+    allow_prereleases: bool = Field(
+        default=False,
+        description="Include a/b/rc pre-releases for every package when true.",
+    )
+    max_attempts: int = Field(
+        default=100_000, ge=1, le=10_000_000,
+        description=(
+            "Per-environment bound on candidate evaluations; each environment "
+            "gets a fresh budget so one hitting the limit does not affect the others."
+        ),
+    )
+    environments: list[EnvironmentInput] = Field(
+        ..., min_length=2, max_length=8,
+        description="2 to 8 uniquely named marker environments; each is resolved independently.",
     )
 
 
@@ -187,7 +237,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Local PEP 440 Dependency Resolver",
-    version="1.5.0",
+    version="1.6.0",
     description=(
         "Resolves transitive dependencies from a self-contained package index. "
         "No external package index or account is used."
@@ -243,28 +293,12 @@ def _resolve_body(
         should_cancel=should_cancel,
     )
 
-    body: dict[str, Any] = {
-        "status": result.status,
-        "attempts": result.attempts,
-        "allow_prereleases": payload.allow_prereleases,
-    }
-    if result.status == "ok":
-        body["resolved"] = result.chosen
-        body["dependency_graph"] = result.edges
-        body["locks"] = result.lock_notes
-        return body, 200, None, result.attempts
-    if result.status == "conflict":
-        body["locks"] = result.lock_notes
-        body["conflict"] = conflict_summary(result)
-        return body, 409, None, result.attempts
-    # limit
-    body["locks"] = result.lock_notes
-    body["conflict"] = conflict_summary(result)
-    body["error"] = {
-        "code": "search_limit_exceeded",
-        "message": f"resolution exceeded {payload.max_attempts} candidate evaluations",
-    }
-    return body, 409, None, result.attempts
+    body, status_code = resolution_body(
+        result,
+        allow_prereleases=payload.allow_prereleases,
+        max_attempts=payload.max_attempts,
+    )
+    return body, status_code, None, result.attempts
 
 
 def run_resolution_job(
@@ -320,6 +354,51 @@ async def diagnose_root_conflict_endpoint(payload: ResolveRequest) -> JSONRespon
         locks,
         allow_prereleases=payload.allow_prereleases,
         marker_env=payload.marker_env,
+        max_attempts=payload.max_attempts,
+    )
+    return JSONResponse(status_code=200, content=body)
+
+
+@app.post("/analyze/environment-matrix")
+async def environment_matrix_endpoint(payload: EnvironmentMatrixRequest) -> JSONResponse:
+    """Resolve the same requirements independently under 2-8 marker environments.
+
+    Accepts the same ``packages``, ``root``, ``locks``,
+    ``allow_prereleases`` and ``max_attempts`` as ``/resolve`` plus a list
+    of uniquely named environments (each with its own ``marker_env``).  The
+    root requirements and transitive dependencies are re-solved from
+    scratch for every environment using its own PEP 508 marker overlays and
+    a fresh attempt budget, so each environment independently reports its
+    own ``ok`` / ``conflict`` / ``limit`` outcome and ``attempts`` — one
+    environment conflicting or hitting the limit never affects the others.
+
+    Successful environments are additionally cross-tabulated into a version
+    matrix: each cell is a resolved version or ``null`` when the package is
+    absent from that environment, and ``differences`` lists packages whose
+    version or presence differs across the successful environments (empty
+    when fewer than two environments succeed).  Environments keep input
+    order; packages are sorted by canonical name.  Always returns 200 for
+    valid input; per-environment 409-style conflict/limit bodies appear
+    inline in ``environments``.
+    """
+    names = [env.name for env in payload.environments]
+    empty = [name for name in names if not name.strip()]
+    if empty:
+        raise ResolutionInputError("environment names must be non-empty strings")
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    if duplicates:
+        raise ResolutionInputError(
+            "environment names must be unique; duplicates: "
+            + ", ".join(repr(name) for name in duplicates)
+        )
+
+    index, entries, locks = _parse_input(payload)
+    body = run_environment_matrix(
+        index,
+        entries,
+        locks,
+        [(env.name, env.marker_env) for env in payload.environments],
+        allow_prereleases=payload.allow_prereleases,
         max_attempts=payload.max_attempts,
     )
     return JSONResponse(status_code=200, content=body)
